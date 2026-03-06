@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import requests
+import schedule
+import time
+import logging
+import signal
+import sys
+from datetime import datetime
+import re
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# 로그 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+
+# 실행 설정
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "<YOUR_DISCORD_WEBHOOK_URL>")
+SERVICE_CK = os.getenv("SERVICE_CK", "corekeeper")
+SERVICE_WC = os.getenv("SERVICE_WC", "watchcore")
+TARGET_STRING = "Game ID:"
+WATCHCORE_STATUS_MESSAGE = "ID:"
+MESSAGE_ID = None
+LAST_STATUS_MESSAGE = None
+
+# 네트워크 재시도 설정
+RETRY_STRATEGY = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "POST", "PATCH"]
+)
+HTTP_ADAPTER = HTTPAdapter(max_retries=RETRY_STRATEGY)
+SESSION = requests.Session()
+SESSION.mount("http://", HTTP_ADAPTER)
+SESSION.mount("https://", HTTP_ADAPTER)
+REQUEST_TIMEOUT = 10
+
+
+def initialize_message_id():
+    """기존 로그에서 마지막 Discord 메시지 ID를 복원한다."""
+    global MESSAGE_ID
+    if MESSAGE_ID is None:
+        MESSAGE_ID = get_last_message_id_from_journal()
+        if MESSAGE_ID:
+            logging.info(f"초기 메시지 ID를 복원했습니다: {MESSAGE_ID}")
+        else:
+            logging.info("초기 메시지 ID를 찾지 못했습니다.")
+
+
+def get_last_message_id_from_journal():
+    """watchcore 서비스 로그에서 마지막 메시지 ID를 찾는다."""
+    try:
+        process = subprocess.run(
+            ["journalctl", "-u", SERVICE_WC, "-n", "20", "--grep", WATCHCORE_STATUS_MESSAGE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if process.returncode == 0 and process.stdout:
+            for line in process.stdout.splitlines():
+                message_id = extract_message_id_from_log(line)
+                if message_id:
+                    return message_id
+        return None
+    except Exception as e:
+        logging.error(f"journalctl에서 메시지 ID를 추출하는 중 오류가 발생했습니다: {e}", exc_info=True)
+        return None
+
+
+def extract_message_id_from_log(log_line):
+    """로그 한 줄에서 Discord 메시지 ID를 추출한다."""
+    match = re.search(r"ID:\s*(\d+)", log_line)
+    if match:
+        return match.group(1)
+    return None
+
+
+def send_or_update_discord_message(content):
+    """Discord 메시지를 새로 보내거나 기존 메시지를 갱신한다."""
+    global MESSAGE_ID
+
+    data = {"content": content}
+
+    try:
+        if MESSAGE_ID and not is_message_id_valid(MESSAGE_ID):
+            logging.warning("기존 MESSAGE_ID가 유효하지 않아 새 메시지를 생성합니다.")
+            MESSAGE_ID = None
+
+        if MESSAGE_ID:
+            response = SESSION.patch(
+                f"{WEBHOOK_URL}/messages/{MESSAGE_ID}", json=data, timeout=REQUEST_TIMEOUT
+            )
+        else:
+            response = SESSION.post(
+                f"{WEBHOOK_URL}?wait=1", json=data, timeout=REQUEST_TIMEOUT
+            )
+
+        if response.status_code in {200, 204}:
+            if not MESSAGE_ID:
+                message_data = response.json()
+                MESSAGE_ID = message_data.get("id")
+                logging.info(f"메시지를 생성했습니다. ID: {MESSAGE_ID}")
+            else:
+                logging.info("메시지를 갱신했습니다.")
+            return True
+
+        logging.warning(f"메시지 처리에 실패했습니다: {response.status_code}, {response.text}")
+        return False
+    except Exception as e:
+        logging.error(f"메시지 처리 중 오류가 발생했습니다: {e}", exc_info=True)
+        return False
+
+
+def is_message_id_valid(message_id):
+    """저장된 Discord 메시지 ID가 아직 유효한지 확인한다."""
+    try:
+        response = SESSION.get(
+            f"{WEBHOOK_URL}/messages/{message_id}", timeout=REQUEST_TIMEOUT
+        )
+        return response.status_code == 200
+    except Exception as e:
+        logging.error(f"메시지 유효성 확인 중 오류가 발생했습니다: {e}", exc_info=True)
+        return False
+
+
+def check_service_status():
+    """Core Keeper 서비스 상태를 확인하고 Discord용 상태 메시지를 만든다."""
+    global LAST_STATUS_MESSAGE
+
+    try:
+        process = subprocess.run(
+            ["systemctl", "is-active", SERVICE_CK],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        if process.returncode == 0 and process.stdout.strip() == "active":
+            last_start_time = get_last_start_time()
+            server_id = get_server_id() or "알 수 없음"
+            corekeeper_status = f"{SERVICE_CK} 서비스가 활성 상태입니다."
+        else:
+            last_start_time = "알 수 없음"
+            server_id = "알 수 없음"
+            corekeeper_status = f"{SERVICE_CK} 서비스가 비활성 상태입니다."
+
+        watchcore_status = "Watchcore가 실행 중입니다."
+
+        new_status_message = f"""**서버 ID**
+```{server_id}``` 
+**서버 상태**
+```{corekeeper_status}``` 
+**최근 서버 시작 시간**
+```{last_start_time}``` 
+**Watchcore 상태**
+```{watchcore_status}```"""
+
+        if new_status_message != LAST_STATUS_MESSAGE:
+            if send_or_update_discord_message(new_status_message):
+                LAST_STATUS_MESSAGE = new_status_message
+            else:
+                logging.warning("상태 메시지 전송에 실패했습니다. 다음 주기에 다시 시도합니다.")
+    except Exception as e:
+        logging.error(f"서버 상태 확인 중 오류가 발생했습니다: {e}", exc_info=True)
+
+
+def get_last_start_time():
+    """로그에서 최근 서버 시작 시간을 찾아 사람이 읽기 쉬운 형식으로 반환한다."""
+    try:
+        process = subprocess.run(
+            ["journalctl", "-u", SERVICE_CK, "--reverse", "-n", "10", "--grep", TARGET_STRING],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if process.returncode == 0 and process.stdout:
+            for line in process.stdout.splitlines():
+                if TARGET_STRING in line:
+                    timestamp_str = " ".join(line.split()[:3])
+                    full_timestamp = datetime.strptime(
+                        f"{datetime.now().year} {timestamp_str}",
+                        "%Y %b %d %H:%M:%S"
+                    )
+                    return full_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        return "알 수 없음"
+    except Exception as e:
+        logging.error(f"시작 시간 추출 중 오류가 발생했습니다: {e}", exc_info=True)
+        return "시간 추출 실패"
+
+
+def get_server_id():
+    """로그에서 서버 ID를 추출한다."""
+    try:
+        process = subprocess.run(
+            ["journalctl", "-u", SERVICE_CK, "--reverse", "-n", "10"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        for line in process.stdout.splitlines():
+            if TARGET_STRING in line:
+                return line.split(TARGET_STRING, 1)[1].strip()
+        return None
+    except Exception as e:
+        logging.error(f"서버 ID 추출 중 오류가 발생했습니다: {e}", exc_info=True)
+        return None
+
+
+def signal_handler(sig, frame):
+    """종료 신호를 받으면 Discord에 종료 상태를 남긴다."""
+    logging.info("종료 신호를 받아 Watchcore를 종료합니다.")
+    if MESSAGE_ID:
+        send_or_update_discord_message("**Watchcore 상태**\n```Watchcore가 종료되었습니다.```")
+    sys.exit(0)
+
+
+def watchdog():
+    """주기적으로 상태를 확인하고 Discord 메시지를 갱신한다."""
+    logging.info("Watchdog가 시작되었습니다.")
+    initialize_message_id()
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    schedule.every(5).seconds.do(check_service_status)
+
+    while True:
+        try:
+            schedule.run_pending()
+            time.sleep(5)
+        except Exception as e:
+            logging.error(f"실행 루프 중 오류가 발생했습니다: {e}", exc_info=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    watchdog()

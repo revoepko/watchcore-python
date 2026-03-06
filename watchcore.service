@@ -1,0 +1,16 @@
+[Unit]
+Description=Watchcore Service
+After=network.target
+
+[Service]
+Type=simple
+User=watchcore
+WorkingDirectory=/opt/watchcore
+ExecStartPre=/bin/sleep 5
+ExecStart=/opt/watchcore/watchcore
+KillMode=process
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

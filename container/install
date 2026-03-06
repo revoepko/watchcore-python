@@ -1,0 +1,11 @@
+# 1. 이미지 빌드
+docker build -t watchcore:latest -f Dockerfile.watchcore .
+
+# 2. 컨테이너 실행
+docker run -d \
+  --name watchcore \
+  --restart unless-stopped \
+  -e WEBHOOK_URL="<YOUR_DISCORD_WEBHOOK_URL>" \
+  -e TARGET_CONTAINER="corekeeper" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  watchcore:latest
